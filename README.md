@@ -1,5 +1,10 @@
 # Echter_Websockets
 
+[![CI](https://github.com/EgyipTomi425/Echter_Websockets/actions/workflows/ci.yml/badge.svg)](https://github.com/EgyipTomi425/Echter_Websockets/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://isocpp.org/)
+[![Linux](https://img.shields.io/badge/Platform-Linux-1f4d7b.svg)](https://www.kernel.org/)
+
 A Linux-first C++23 WebSocket client built for nonblocking sockets, `io_uring`,
 and OpenSSL 3. The project focuses on one goal: reliable client-side WSS
 connectivity with bounded memory usage, explicit lifecycle states, and a clear
