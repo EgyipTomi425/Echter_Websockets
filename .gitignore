@@ -1,0 +1,8 @@
+# generated build outputs
+/build/
+/build-*/
+/cmake-build-*/
+
+# editor noise
+.vscode/
+.DS_Store
