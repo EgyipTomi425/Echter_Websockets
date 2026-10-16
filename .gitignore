@@ -2,7 +2,10 @@
 /build/
 /build-*/
 /cmake-build-*/
+__pycache__/
+*.pyc
+*.pyo
 
 # editor noise
 .vscode/
-.DS_Store__pycache__/
+.DS_Store
