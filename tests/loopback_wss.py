@@ -138,6 +138,7 @@ async def serve_one(reader, writer, metrics, drop_id):
             elif opcode == 9:
                 await write_frame(writer, 10, payload)
             elif opcode == 8:
+                await asyncio.sleep(0.05)
                 await write_frame(writer, 8, payload)
                 metrics["echoes"][identity] = echoes
                 if received_pong:

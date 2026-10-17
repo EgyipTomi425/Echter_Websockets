@@ -133,6 +133,8 @@ sender.send_binary(payload);
 - `close()` requests a normal close handshake and returns whether the command was accepted.
 - `Connection::state()` reports the atomic lifecycle snapshot: `pending`, `open`,
   `closing`, `closed`, or `failed`.
+- An accepted `close()` request immediately reports `closing`; `on_close` runs
+    after transport cleanup and observes `closed`.
 - Callback delivery is queued and serialized per connection; user callbacks run on
   worker threads, not on the network reactor.
 - Sending on a terminal connection throws `std::logic_error`.

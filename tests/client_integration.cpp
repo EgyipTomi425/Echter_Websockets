@@ -186,8 +186,23 @@ int main(int argc, char** argv) {
 						const std::string& expected = state.echoed_messages[index] == 0 ? first : second;
 						if (payload != expected) state.error = "echo message was misrouted or reordered";
 						++state.echoed_messages[index];
-						if (state.echoed_messages[index] == 2 && !connection.close()) {
-							state.error = "close request was rejected";
+						if (state.echoed_messages[index] == 2) {
+							if (!connection.close()) {
+								state.error = "close request was rejected";
+							} else {
+								if (connection.state() != echter::ws::client::ConnectionState::closing) {
+									state.error = "accepted close request did not publish closing state";
+								}
+								bool late_send_rejected = false;
+								try {
+									connection.send_message("late-send");
+								} catch (const std::logic_error&) {
+									late_send_rejected = true;
+								}
+								if (!late_send_rejected) {
+									state.error = "send was accepted after close request";
+								}
+							}
 						}
 					}
 				}
@@ -395,6 +410,26 @@ int main(int argc, char** argv) {
 			std::cerr << "Client destruction from on_open callback timed out\n";
 			return 1;
 		}
+	}
+
+	echter::ws::client::Connection orphaned_connection;
+	{
+		echter::ws::client::Client short_lived_client;
+		orphaned_connection = short_lived_client.connect(argv[1]);
+	}
+	if (orphaned_connection.state() != echter::ws::client::ConnectionState::closed) {
+		std::cerr << "connection handle outlived its Client without entering closed state\n";
+		return 1;
+	}
+	bool orphaned_send_rejected = false;
+	try {
+		orphaned_connection.send_message("after-client-destruction");
+	} catch (const std::logic_error&) {
+		orphaned_send_rejected = true;
+	}
+	if (!orphaned_send_rejected) {
+		std::cerr << "connection handle accepted a send after Client destruction\n";
+		return 1;
 	}
 
 	std::cout << connection_count << " concurrent WSS sessions passed; "

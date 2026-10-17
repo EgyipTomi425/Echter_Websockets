@@ -199,6 +199,8 @@ struct SocketConnection {
 	bool close_sent = false;
 	bool close_received = false;
 	bool close_notified = false;
+	std::uint16_t close_code = 1006;
+	std::string close_reason;
 
 	~SocketConnection() {
 		if (ssl != nullptr) SSL_free(ssl);
@@ -314,6 +316,13 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 		{
 			std::lock_guard lock(command_mutex);
 			if (commands.size() >= max_pending_commands) return false;
+			if ((command.type == CommandType::send || command.type == CommandType::close)
+				&& command.lifecycle) {
+				const ConnectionState state = command.lifecycle->state.load(
+					std::memory_order_acquire);
+				if (state == ConnectionState::closing || state == ConnectionState::closed
+					|| state == ConnectionState::failed) return false;
+			}
 			if (command.type == CommandType::send) {
 				command.accounted_bytes = command.payload.size() + 14;
 				if (command.accounted_bytes > max_outgoing_bytes - pending_outgoing_bytes) return false;
@@ -338,6 +347,10 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 			}
 			if (commands.back().type == CommandType::send) {
 				pending_outgoing_bytes += commands.back().accounted_bytes;
+			}
+			if (commands.back().type == CommandType::close && commands.back().lifecycle) {
+				commands.back().lifecycle->state.store(ConnectionState::closing,
+					std::memory_order_release);
 			}
 		}
 		wake();
@@ -587,6 +600,7 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 			if (current != ConnectionState::failed) {
 				found->second->lifecycle->state.store(ConnectionState::closed,
 					std::memory_order_release);
+				notify_close(*found->second);
 			}
 		}
 		if (found->second->has_deadline) deadlines.erase({found->second->deadline, id});
@@ -701,7 +715,30 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 				stopping.store(true, std::memory_order_release);
 			}
 		}
+		for (auto& [id, connection] : connections) {
+			(void)id;
+			if (!connection->lifecycle) continue;
+			const ConnectionState state = connection->lifecycle->state.load(
+				std::memory_order_acquire);
+			if (state != ConnectionState::failed) {
+				connection->lifecycle->state.store(ConnectionState::closed,
+					std::memory_order_release);
+			}
+		}
 		connections.clear();
+		{
+			std::lock_guard lock(command_mutex);
+			for (Command& command : commands) {
+				if (!command.lifecycle) continue;
+				const ConnectionState state = command.lifecycle->state.load(
+					std::memory_order_acquire);
+				if (state != ConnectionState::failed) {
+					command.lifecycle->state.store(ConnectionState::closed,
+						std::memory_order_release);
+				}
+			}
+			commands.clear();
+		}
 		deadlines.clear();
 	}
 
@@ -968,8 +1005,10 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 			try { echter::ws::detail::validate_upgrade(connection.response, connection.key); }
 			catch (const std::exception& error) { fail(connection.id, error.what()); return false; }
 			connection.stage = SocketConnection::Stage::open;
-			connection.lifecycle->state.store(ConnectionState::open,
-				std::memory_order_release);
+			ConnectionState expected_state = ConnectionState::pending;
+			connection.lifecycle->state.compare_exchange_strong(expected_state,
+				ConnectionState::open, std::memory_order_release,
+				std::memory_order_acquire);
 			set_timeout(connection.id, connection.timeouts.idle);
 			if (connection.callbacks->on_open) {
 				auto callbacks = connection.callbacks;
@@ -1021,8 +1060,8 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 			if (result != 1) {
 				const int error = SSL_get_error(connection.ssl, result);
 				if (error == SSL_ERROR_ZERO_RETURN) {
-					notify_close(connection, 1006,
-						"TLS closed without a WebSocket close frame");
+					connection.close_code = 1006;
+					connection.close_reason = "TLS closed without a WebSocket close frame";
 					return false;
 				}
 				return wait_for(connection, error);
@@ -1053,10 +1092,11 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 							? std::string(reinterpret_cast<const char*>(frame.payload.data() + 2), frame.payload.size() - 2)
 							: std::string{};
 					connection.close_received = true;
+					connection.close_code = code;
+					connection.close_reason = reason;
 					connection.closing = true;
 					connection.lifecycle->state.store(ConnectionState::closing,
 						std::memory_order_release);
-					notify_close(connection, code, reason);
 					if (connection.close_sent) return false;
 					const bool partial_frame = connection.outgoing_offset > 0;
 					const bool partial_close = partial_frame
@@ -1098,18 +1138,15 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 		return true;
 	}
 
-	bool notify_close(SocketConnection& connection, std::uint16_t code,
-		std::string reason) {
-		if (connection.close_notified) return true;
+	void notify_close(SocketConnection& connection) {
+		if (connection.close_notified) return;
 		connection.close_notified = true;
-		connection.lifecycle->state.store(ConnectionState::closed,
-			std::memory_order_release);
 		auto callbacks = connection.callbacks;
-		if (!callbacks->on_close) return true;
+		if (!callbacks->on_close) return;
 		Connection connection_handle = handle(connection.id);
-		return post_callback(connection.id, [callbacks = std::move(callbacks),
-			connection_handle = std::move(connection_handle), code,
-			reason = std::move(reason)]() mutable {
+		post_callback(connection.id, [callbacks = std::move(callbacks),
+			connection_handle = std::move(connection_handle), code = connection.close_code,
+			reason = std::move(connection.close_reason)]() mutable {
 			if (callbacks->on_close) {
 				callbacks->on_close(std::move(connection_handle), code, reason);
 			}
@@ -1277,40 +1314,63 @@ void Connection::send_message(std::string_view message) const {
 		throw std::invalid_argument("WebSocket text message is not valid UTF-8");
 	}
 	if (!impl_) return;
-	if (state() == ConnectionState::closed || state() == ConnectionState::failed) {
+	const ConnectionState current_state = state();
+	if (current_state == ConnectionState::closing || current_state == ConnectionState::closed
+		|| current_state == ConnectionState::failed) {
 		throw std::logic_error("cannot send on a closed WebSocket connection");
 	}
 	if (auto runtime = impl_->runtime.lock()) {
-		detail::Command command{.type = detail::CommandType::send, .id = impl_->id, .message_type = MessageType::text};
+		detail::Command command{.type = detail::CommandType::send, .id = impl_->id,
+			.message_type = MessageType::text, .lifecycle = impl_->lifecycle};
 		command.payload.resize(message.size());
 		std::memcpy(command.payload.data(), message.data(), message.size());
 		if (!runtime->post(std::move(command))) {
+			const ConnectionState state_after_rejection = state();
+			if (state_after_rejection == ConnectionState::closing
+				|| state_after_rejection == ConnectionState::closed
+				|| state_after_rejection == ConnectionState::failed) {
+				throw std::logic_error("cannot send on a closed WebSocket connection");
+			}
 			throw std::length_error("WebSocket outbound queue limit exceeded");
 		}
+	} else {
+		throw std::logic_error("cannot send on a closed WebSocket connection");
 	}
 }
 
 void Connection::send_binary(std::span<const std::byte> message) const {
 	if (message.size() > max_message_size) throw std::length_error("WebSocket message exceeds the 8 MiB limit");
 	if (!impl_) return;
-	if (state() == ConnectionState::closed || state() == ConnectionState::failed) {
+	const ConnectionState current_state = state();
+	if (current_state == ConnectionState::closing || current_state == ConnectionState::closed
+		|| current_state == ConnectionState::failed) {
 		throw std::logic_error("cannot send on a closed WebSocket connection");
 	}
 	if (auto runtime = impl_->runtime.lock()) {
 		detail::Command command{.type = detail::CommandType::send, .id = impl_->id,
 			.payload = std::vector<std::byte>(message.begin(), message.end()),
-			.message_type = MessageType::binary};
+			.message_type = MessageType::binary, .lifecycle = impl_->lifecycle};
 		if (!runtime->post(std::move(command))) {
+			const ConnectionState state_after_rejection = state();
+			if (state_after_rejection == ConnectionState::closing
+				|| state_after_rejection == ConnectionState::closed
+				|| state_after_rejection == ConnectionState::failed) {
+				throw std::logic_error("cannot send on a closed WebSocket connection");
+			}
 			throw std::length_error("WebSocket outbound queue limit exceeded");
 		}
+	} else {
+		throw std::logic_error("cannot send on a closed WebSocket connection");
 	}
 }
 
 bool Connection::close() const {
 	if (impl_) {
-		if (state() == ConnectionState::closed || state() == ConnectionState::failed) return false;
+		if (state() == ConnectionState::closing || state() == ConnectionState::closed
+			|| state() == ConnectionState::failed) return false;
 		if (auto runtime = impl_->runtime.lock()) {
-			return runtime->post({.type = detail::CommandType::close, .id = impl_->id});
+			return runtime->post({.type = detail::CommandType::close, .id = impl_->id,
+				.lifecycle = impl_->lifecycle});
 		}
 	}
 	return false;
