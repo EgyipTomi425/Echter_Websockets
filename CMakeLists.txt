@@ -29,6 +29,7 @@ target_link_libraries(localtest PRIVATE echter_websockets)
 if(BUILD_TESTING)
     add_executable(echter_ws_frame_tests tests/frame_tests.cpp)
     target_link_libraries(echter_ws_frame_tests PRIVATE echter_websockets)
+    target_compile_options(echter_ws_frame_tests PRIVATE -UNDEBUG)
     add_test(NAME echter_ws_frame_tests COMMAND echter_ws_frame_tests)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)

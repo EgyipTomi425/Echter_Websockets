@@ -35,9 +35,14 @@ void test_consecutive_complete_messages() {
 
 void test_control_frame_inside_fragmented_message() {
 	echter::ws::MessageAssembler assembler;
-	assert(!assembler.consume(make_frame(echter::ws::FrameType::text, false, "hel")));
-	assert(!assembler.consume(make_frame(echter::ws::FrameType::ping, true, "p")));
-	assert(!assembler.consume(make_frame(echter::ws::FrameType::continuation, false, "l")));
+	const auto first_fragment = assembler.consume(
+		make_frame(echter::ws::FrameType::text, false, "hel"));
+	assert(!first_fragment);
+	const auto ping = assembler.consume(make_frame(echter::ws::FrameType::ping, true, "p"));
+	assert(!ping);
+	const auto second_fragment = assembler.consume(
+		make_frame(echter::ws::FrameType::continuation, false, "l"));
+	assert(!second_fragment);
 	auto complete = assembler.consume(make_frame(echter::ws::FrameType::continuation, true, "o"));
 	assert(complete && complete->type == echter::ws::MessageType::text);
 	assert(view(complete->payload) == "hello");
@@ -53,7 +58,9 @@ void test_invalid_fragment_transitions() {
 	}
 	assert(unexpected_continuation);
 
-	assert(!assembler.consume(make_frame(echter::ws::FrameType::text, false, "x")));
+	const auto first_fragment = assembler.consume(
+		make_frame(echter::ws::FrameType::text, false, "x"));
+	assert(!first_fragment);
 	bool interleaved_data = false;
 	try {
 		(void)assembler.consume(make_frame(echter::ws::FrameType::binary, true, "y"));
@@ -121,7 +128,9 @@ void test_noncanonical_payload_lengths() {
 
 void test_text_utf8_validation_after_reassembly() {
 	echter::ws::MessageAssembler assembler;
-	assert(!assembler.consume(make_frame(echter::ws::FrameType::text, false, "\xc3")));
+	const auto first_fragment = assembler.consume(
+		make_frame(echter::ws::FrameType::text, false, "\xc3"));
+	assert(!first_fragment);
 	auto valid = assembler.consume(make_frame(echter::ws::FrameType::continuation, true, "\xa9"));
 	assert(valid && view(valid->payload) == "\xc3\xa9");
 

@@ -1102,7 +1102,7 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 		std::string reason) {
 		if (connection.close_notified) return true;
 		connection.close_notified = true;
-		connection.lifecycle->state.store(ConnectionState::closing,
+		connection.lifecycle->state.store(ConnectionState::closed,
 			std::memory_order_release);
 		auto callbacks = connection.callbacks;
 		if (!callbacks->on_close) return true;
