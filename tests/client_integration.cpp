@@ -280,6 +280,9 @@ int main(int argc, char** argv) {
 		flood_url += "client=50001";
 		[[maybe_unused]] auto flood_connection = flood_client.connect(flood_url,
 			echter::ws::client::Callbacks{
+				.on_open = {},
+				.on_message = {},
+				.on_close = {},
 				.on_error = [&](echter::ws::client::Connection, std::string_view error) {
 					{
 						std::lock_guard lock(flood_mutex);
@@ -312,6 +315,9 @@ int main(int argc, char** argv) {
 		cancellation_url += "client=7";
 		auto cancellation_connection = cancellation_client.connect(cancellation_url,
 			echter::ws::client::Callbacks{
+				.on_open = {},
+				.on_message = {},
+				.on_close = {},
 				.on_error = [&](echter::ws::client::Connection connection,
 						std::string_view error) {
 					std::lock_guard lock(cancellation_mutex);
@@ -348,6 +354,9 @@ int main(int argc, char** argv) {
 		no_response_url += "client=50003";
 		auto no_response_connection = no_response_client.connect(no_response_url,
 			echter::ws::client::Callbacks{
+				.on_open = {},
+				.on_message = {},
+				.on_close = {},
 				.on_error = [&](echter::ws::client::Connection connection,
 						std::string_view error) {
 					std::lock_guard lock(no_response_mutex);
@@ -397,6 +406,9 @@ int main(int argc, char** argv) {
 				}
 				teardown_changed.notify_all();
 			},
+			.on_message = {},
+			.on_close = {},
+			.on_error = {},
 		});
 	{
 		std::lock_guard lock(teardown_mutex);

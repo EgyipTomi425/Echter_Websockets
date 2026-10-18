@@ -138,17 +138,17 @@ struct ResolvedAddress {
 };
 
 struct Command {
-	CommandType type;
+	CommandType type = CommandType::start;
 	std::uint64_t id = 0;
-	echter::ws::detail::Url url;
-	Callbacks callbacks;
-	std::vector<std::byte> payload;
+	echter::ws::detail::Url url{};
+	Callbacks callbacks{};
+	std::vector<std::byte> payload{};
 	MessageType message_type = MessageType::text;
 	int error = 0;
-	std::vector<ResolvedAddress> addresses;
-	Timeouts timeouts;
+	std::vector<ResolvedAddress> addresses{};
+	Timeouts timeouts{};
 	std::size_t accounted_bytes = 0;
-	std::shared_ptr<ConnectionLifecycle> lifecycle;
+	std::shared_ptr<ConnectionLifecycle> lifecycle{};
 };
 
 struct ResolveTask {

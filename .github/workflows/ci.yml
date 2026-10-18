@@ -22,7 +22,7 @@ jobs:
         env:
           CC: gcc
           CXX: g++
-        run: cmake -S . -B build -G Ninja -DCMAKE_CXX_SCAN_FOR_MODULES=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_CXX_SCAN_FOR_MODULES=ON -DCMAKE_CXX_FLAGS='-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror -Wno-error=attributes'
 
       - name: Build
         env:

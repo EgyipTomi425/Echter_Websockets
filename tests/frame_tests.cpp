@@ -157,7 +157,8 @@ void test_close_payload_validation() {
 	echter::ws::validate_close_payload(valid_close);
 	echter::ws::validate_close_payload({});
 
-	for (const std::uint16_t code : {1004, 1005, 1006, 1015, 2000, 5000}) {
+	constexpr std::array<std::uint16_t, 6> invalid_codes{1004, 1005, 1006, 1015, 2000, 5000};
+	for (const std::uint16_t code : invalid_codes) {
 		const std::array<std::byte, 2> payload{
 			static_cast<std::byte>(code >> 8), static_cast<std::byte>(code)};
 		bool rejected = false;
