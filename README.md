@@ -22,6 +22,7 @@ local validation and integration testing.
 - Per-connection callback ordering with bounded callback queues
 - Strict lifecycle states: `pending`, `open`, `closing`, `closed`, `failed`
 - CPU and memory limits to avoid runaway connection storms
+- RAII ownership for sockets, TLS contexts, and the `io_uring` runtime
 - Deterministic local WSS validation peer for tests
 
 ## Project layout
@@ -153,6 +154,11 @@ sender.send_binary(payload);
 - Callback delivery is queued and serialized per connection; user callbacks run on
   worker threads, not on the network reactor.
 - Sending on a terminal connection throws `std::logic_error`.
+- A TLS shutdown without a WebSocket close frame is reported through `on_close`
+    with status code `1006`; this indicates an abnormal transport close, not a
+    completed WebSocket close handshake.
+- Destroying the client from one of its callback workers defers runtime teardown
+    to a reaper thread so that teardown does not attempt to join the current worker.
 
 ## Runtime architecture
 
@@ -179,6 +185,11 @@ The runtime is deliberately split into three execution domains:
     - runs raw-DEFLATE compression/decompression outside the reactor and callback workers
     - uses one bounded worker queue to preserve per-connection codec ordering
     - leaves frame encoding, socket readiness, and TLS writes to the reactor
+
+Worker queues are bounded. Applications should keep callbacks short and move
+blocking work to their own executor; a saturated callback queue fails the
+connection rather than growing without limit. DNS resolution itself uses the
+blocking system resolver, isolated on resolver workers.
 
 ### Event flow
 
