@@ -19,13 +19,16 @@ namespace {
 struct TestState {
 	explicit TestState(std::size_t size)
 		: opened(size), invalid_text_rejected(size), server_messages(size),
-		  echoed_messages(size), closed(size), failed(size), late_send_rejected(size) {}
+		  echoed_messages(size), binary_messages(size), close_requested(size),
+		  closed(size), failed(size), late_send_rejected(size) {}
 	std::mutex mutex;
 	std::condition_variable changed;
 	std::vector<bool> opened;
 	std::vector<bool> invalid_text_rejected;
 	std::vector<int> server_messages;
 	std::vector<int> echoed_messages;
+	std::vector<int> binary_messages;
+	std::vector<bool> close_requested;
 	std::vector<bool> closed;
 	std::vector<bool> failed;
 	std::vector<bool> late_send_rejected;
@@ -39,8 +42,13 @@ std::string as_string(std::span<const std::byte> bytes) {
 } // namespace
 
 int main(int argc, char** argv) {
-	if (argc < 2 || argc > 4) {
-		std::cerr << "usage: echter_ws_client_integration_tests wss-url [client-count [drop-id]]\n";
+	if (argc < 2 || argc > 5) {
+		std::cerr << "usage: echter_ws_client_integration_tests wss-url [client-count [drop-id [deflate]]]\n";
+		return 2;
+	}
+	const bool compression_enabled = argc == 5 && std::string_view(argv[4]) == "deflate";
+	if (argc == 5 && !compression_enabled) {
+		std::cerr << "compression mode must be 'deflate'\n";
 		return 2;
 	}
 	std::size_t connection_count = 5;
@@ -55,7 +63,7 @@ int main(int argc, char** argv) {
 		}
 	}
 	std::size_t expected_drop = 0;
-	if (argc == 4) {
+	if (argc >= 4) {
 		const std::string_view value(argv[3]);
 		const auto parsed = std::from_chars(value.data(), value.data() + value.size(),
 			expected_drop);
@@ -97,6 +105,18 @@ int main(int argc, char** argv) {
 		std::cerr << "client accepted a connection limit beyond the terminal callback budget\n";
 		return 1;
 	}
+	bool rejected_header_injection = false;
+	try {
+		echter::ws::client::Client invalid_client(
+			echter::ws::client::ClientOptions{
+				.origin = "https://example.test\r\nX-Injected: yes"});
+	} catch (const std::invalid_argument&) {
+		rejected_header_injection = true;
+	}
+	if (!rejected_header_injection) {
+		std::cerr << "client accepted a control character in a handshake header\n";
+		return 1;
+	}
 	{
 		echter::ws::client::Client limited_client(
 			echter::ws::client::ClientOptions{.max_connections = 1, .max_outgoing_bytes = 1});
@@ -122,10 +142,30 @@ int main(int argc, char** argv) {
 			return 1;
 		}
 	}
+	{
+		echter::ws::client::Client limited_compression_client(
+			echter::ws::client::ClientOptions{.max_connections = 1,
+				.enable_permessage_deflate = true,
+				.max_compression_queue_bytes = 128});
+		auto connection = limited_compression_client.connect(argv[1]);
+		bool rejected_compression_queue = false;
+		try {
+			connection.send_message("x");
+		} catch (const std::length_error&) {
+			rejected_compression_queue = true;
+		}
+		if (!rejected_compression_queue) {
+			std::cerr << "client accepted a send beyond max_compression_queue_bytes\n";
+			return 1;
+		}
+	}
 
 	TestState state(connection_count);
 	echter::ws::client::Client client(
-		echter::ws::client::ClientOptions{.max_connections = connection_count});
+		echter::ws::client::ClientOptions{.max_connections = connection_count,
+			.enable_permessage_deflate = compression_enabled,
+			.origin = "https://empire.goodgamestudios.com",
+			.user_agent = "integration-test"});
 	std::vector<echter::ws::client::Connection> handles(connection_count);
 	const echter::ws::client::Timeouts session_timeouts{
 		.connect = std::chrono::seconds(60),
@@ -135,13 +175,21 @@ int main(int argc, char** argv) {
 	};
 
 	for (std::size_t index = 0; index < connection_count; ++index) {
-		const std::string first = "first-" + std::to_string(index);
-		const std::string second = "second-" + std::to_string(index);
+		const std::string first = compression_enabled
+			? std::string(4096, static_cast<char>('a' + index % 20))
+			: "first-" + std::to_string(index);
+		const std::string second = compression_enabled
+			? std::string(4096, static_cast<char>('A' + index % 20))
+			: "second-" + std::to_string(index);
+		std::string binary(4096, '\0');
+		for (std::size_t offset = 0; offset < binary.size(); ++offset) {
+			binary[offset] = static_cast<char>((offset + index) & 0xff);
+		}
 		std::string url(argv[1]);
 		url += url.find('?') == std::string::npos ? "?" : "&";
-		url += "client=" + std::to_string(index);
+		url += "client=" + std::to_string(index) + "&header-test=1";
 		handles[index] = client.connect(url, echter::ws::client::Callbacks{
-			.on_open = [&, index, first, second](echter::ws::client::Connection connection) {
+			.on_open = [&, index, first, second, binary](echter::ws::client::Connection connection) {
 				const auto observed_state = connection.state();
 				bool invalid_text_rejected = false;
 				try {
@@ -164,14 +212,23 @@ int main(int argc, char** argv) {
 				}
 				connection.send_message(first);
 				connection.send_message(second);
+				if (compression_enabled) {
+					connection.send_binary(std::span<const std::byte>(
+						reinterpret_cast<const std::byte*>(binary.data()), binary.size()));
+				}
 				state.changed.notify_all();
 			},
-			.on_message = [&, index, first, second](echter::ws::client::Connection connection,
+			.on_message = [&, index, first, second, binary](echter::ws::client::Connection connection,
 											   echter::ws::MessageType type,
 										   std::span<const std::byte> message) {
 				std::lock_guard lock(state.mutex);
-				if (type != echter::ws::MessageType::text) {
-					state.error = "received a non-text response";
+				if (type == echter::ws::MessageType::binary) {
+					if (!compression_enabled || as_string(message) != binary) {
+						state.error = "compressed binary response was corrupted";
+					}
+					++state.binary_messages[index];
+				} else if (type != echter::ws::MessageType::text) {
+					state.error = "received an unsupported response type";
 				} else {
 					const std::string payload = as_string(message);
 					const std::string server_prefix = "server-" + std::to_string(index) + "-";
@@ -186,24 +243,24 @@ int main(int argc, char** argv) {
 						const std::string& expected = state.echoed_messages[index] == 0 ? first : second;
 						if (payload != expected) state.error = "echo message was misrouted or reordered";
 						++state.echoed_messages[index];
-						if (state.echoed_messages[index] == 2) {
-							if (!connection.close()) {
-								state.error = "close request was rejected";
-							} else {
-								if (connection.state() != echter::ws::client::ConnectionState::closing) {
-									state.error = "accepted close request did not publish closing state";
-								}
-								bool late_send_rejected = false;
-								try {
-									connection.send_message("late-send");
-								} catch (const std::logic_error&) {
-									late_send_rejected = true;
-								}
-								if (!late_send_rejected) {
-									state.error = "send was accepted after close request";
-								}
-							}
+					}
+				}
+				if (!state.close_requested[index] && state.echoed_messages[index] == 2
+					&& (!compression_enabled || state.binary_messages[index] == 2)) {
+					state.close_requested[index] = true;
+					if (!connection.close()) {
+						state.error = "close request was rejected";
+					} else {
+						if (connection.state() != echter::ws::client::ConnectionState::closing) {
+							state.error = "accepted close request did not publish closing state";
 						}
+						bool late_send_rejected = false;
+						try {
+							connection.send_message("late-send");
+						} catch (const std::logic_error&) {
+							late_send_rejected = true;
+						}
+						if (!late_send_rejected) state.error = "send was accepted after close request";
 					}
 				}
 				state.changed.notify_all();
@@ -246,12 +303,20 @@ int main(int argc, char** argv) {
 				if (index == expected_drop) continue;
 				if (!state.opened[index] || state.server_messages[index] != 2
 					|| state.echoed_messages[index] != 2 || !state.closed[index]
-					|| !state.invalid_text_rejected[index]) return false;
+					|| !state.invalid_text_rejected[index]
+					|| (compression_enabled && state.binary_messages[index] != 2)) return false;
 			}
 			return true;
 		});
 		if (!completed) {
 			std::cerr << "timed out waiting for randomized WSS sessions and the scripted drop\n";
+			for (std::size_t index = 0; index < connection_count; ++index) {
+				std::cerr << "client " << index << ": server=" << state.server_messages[index]
+					<< " text_echo=" << state.echoed_messages[index]
+					<< " binary=" << state.binary_messages[index]
+					<< " closed=" << state.closed[index]
+					<< " failed=" << state.failed[index] << '\n';
+			}
 			return 1;
 		}
 		if (!state.error.empty()) {
@@ -261,6 +326,38 @@ int main(int argc, char** argv) {
 		if (handles[expected_drop].state() != echter::ws::client::ConnectionState::failed
 			|| !state.late_send_rejected[expected_drop]) {
 			std::cerr << "failed connection state or late-send rejection was not observable\n";
+			return 1;
+		}
+	}
+
+	if (compression_enabled && std::string_view(argv[1]).find("run=2") != std::string_view::npos) {
+		std::mutex bomb_mutex;
+		std::condition_variable bomb_changed;
+		std::string bomb_error;
+		echter::ws::client::Client bomb_client(
+			echter::ws::client::ClientOptions{.max_connections = 1,
+				.enable_permessage_deflate = true});
+		std::string bomb_url(argv[1]);
+		bomb_url += bomb_url.find('?') == std::string::npos ? "?" : "&";
+		bomb_url += "client=50004";
+		auto bomb_connection = bomb_client.connect(bomb_url,
+			echter::ws::client::Callbacks{
+				.on_open = {},
+				.on_message = {},
+				.on_close = {},
+				.on_error = [&](echter::ws::client::Connection, std::string_view error) {
+					std::lock_guard lock(bomb_mutex);
+					bomb_error.assign(error);
+					bomb_changed.notify_one();
+				},
+			});
+		std::unique_lock lock(bomb_mutex);
+		if (!bomb_changed.wait_for(lock, std::chrono::seconds(15),
+				[&] { return !bomb_error.empty(); })
+			|| bomb_error.find("8 MiB limit") == std::string::npos
+			|| bomb_connection.state() != echter::ws::client::ConnectionState::failed) {
+			std::cerr << "compressed expansion did not fail at the 8 MiB limit: "
+				<< bomb_error << '\n';
 			return 1;
 		}
 	}
@@ -388,7 +485,8 @@ int main(int argc, char** argv) {
 	std::condition_variable teardown_changed;
 	bool connect_returned = false;
 	bool client_destroyed_in_callback = false;
-	auto callback_client = std::make_unique<echter::ws::client::Client>();
+	auto callback_client = std::make_unique<echter::ws::client::Client>(
+		echter::ws::client::ClientOptions{.enable_permessage_deflate = true});
 	std::string teardown_url(argv[1]);
 	teardown_url += teardown_url.find('?') == std::string::npos ? "?" : "&";
 	teardown_url += "client=5";

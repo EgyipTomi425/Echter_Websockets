@@ -11,11 +11,13 @@ import subprocess
 import sys
 import tempfile
 import urllib.parse
+import zlib
 
 
 FLOOD_CLIENT_ID = 50_001
 CANCEL_CLIENT_ID = 50_002
 NO_RESPONSE_CLIENT_ID = 50_003
+DECOMPRESSION_BOMB_CLIENT_ID = 50_004
 
 
 async def read_exact(reader, size):
@@ -37,11 +39,11 @@ async def read_frame(reader):
     payload = await read_exact(reader, length)
     if mask:
         payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
-    return first & 0x0f, payload
+    return first & 0x0f, payload, bool(first & 0x40), bool(first & 0x80)
 
 
-def encode_frame(opcode, payload):
-    first = 0x80 | opcode
+def encode_frame(opcode, payload, final=True, compressed=False):
+    first = (0x80 if final else 0) | (0x40 if compressed else 0) | opcode
     length = len(payload)
     if length < 126:
         header = bytes((first, length))
@@ -55,6 +57,36 @@ def encode_frame(opcode, payload):
 async def write_frame(writer, opcode, payload):
     writer.write(encode_frame(opcode, payload))
     await writer.drain()
+
+
+def compress_message(payload, compressor=None):
+    if compressor is None:
+        compressor = zlib.compressobj(wbits=-15)
+    compressed = compressor.compress(payload) + compressor.flush(zlib.Z_SYNC_FLUSH)
+    if not compressed.endswith(b"\x00\x00\xff\xff"):
+        raise RuntimeError("missing permessage-deflate sync-flush tail")
+    return compressed[:-4]
+
+
+def decompress_message(payload, inflater=None):
+    if inflater is None:
+        inflater = zlib.decompressobj(wbits=-15)
+    return inflater.decompress(payload + b"\x00\x00\xff\xff")
+
+
+async def write_message(writer, opcode, payload, compressed=False, interleave_ping=False,
+        compressor=None):
+    wire_payload = compress_message(payload, compressor) if compressed else payload
+    if interleave_ping and len(wire_payload) > 2:
+        split = len(wire_payload) // 2
+        writer.write(encode_frame(opcode, wire_payload[:split], final=False,
+            compressed=compressed))
+        await write_frame(writer, 9, b"fragment-ping")
+        writer.write(encode_frame(0, wire_payload[split:]))
+        await writer.drain()
+    else:
+        writer.write(encode_frame(opcode, wire_payload, compressed=compressed))
+        await writer.drain()
 
 
 async def serve_one(reader, writer, metrics, drop_id):
@@ -73,7 +105,18 @@ async def serve_one(reader, writer, metrics, drop_id):
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(request_target).query)
         client_id = int(query["client"][0])
         run_id = int(query["run"][0])
+        checks_client_headers = query.get("header-test") == ["1"]
         identity = (run_id, client_id)
+        compression_offered = "permessage-deflate" in headers.get(
+            "sec-websocket-extensions", "")
+        compression_enabled = compression_offered and run_id in (2, 4)
+        context_takeover = run_id == 4
+        if checks_client_headers:
+            if headers.get("origin") != "https://empire.goodgamestudios.com":
+                raise ValueError("SDK Origin header did not match the configured game origin")
+            if headers.get("user-agent") != "integration-test":
+                raise ValueError("SDK User-Agent header was missing or altered")
+            metrics["configured_headers"].add(identity)
 
         if client_id == NO_RESPONSE_CLIENT_ID:
             metrics["no_responses"].add(identity)
@@ -82,16 +125,36 @@ async def serve_one(reader, writer, metrics, drop_id):
             return
 
         key = headers["sec-websocket-key"]
+        if run_id == 5 and compression_offered:
+            writer.write((
+                "HTTP/1.1 400 Bad Request\r\n"
+                "Connection: close\r\n"
+                "Content-Length: 0\r\n\r\n"
+            ).encode("ascii"))
+            await writer.drain()
+            metrics["extension_rejections"].add(identity)
+            return
+        if run_id == 5:
+            metrics["extension_fallbacks"].add(identity)
         accept = base64.b64encode(hashlib.sha1(
             (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
         ).digest()).decode("ascii")
-        writer.write(( 
+        if compression_enabled and context_takeover:
+            extension_response = "Sec-WebSocket-Extensions: permessage-deflate\r\n"
+        elif compression_enabled:
+            extension_response = "Sec-WebSocket-Extensions: permessage-deflate\r\n"
+        else:
+            extension_response = ""
+        writer.write((
             "HTTP/1.1 101 Switching Protocols\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n"
+            f"{extension_response}\r\n"
         ).encode("ascii"))
         await writer.drain()
+        if compression_enabled:
+            metrics["negotiated"].add(identity)
 
         if client_id == drop_id:
             metrics["drops"].add(identity)
@@ -120,20 +183,40 @@ async def serve_one(reader, writer, metrics, drop_id):
                 pass
             return
 
+        if client_id == DECOMPRESSION_BOMB_CLIENT_ID:
+            payload = b"z" * (8 * 1024 * 1024 + 1)
+            await write_message(writer, 1, payload, compressed=compression_enabled)
+            await reader.read(1)
+            metrics["decompression_bombs"].add(identity)
+            return
+
         rng = random.Random(2026 + run_id * 100 + client_id)
         colors = ("red", "green", "blue", "gold")
-        for _ in range(2):
-            await write_frame(writer, 1,
-                f"server-{client_id}-{rng.choice(colors)}".encode("ascii"))
+        server_compressor = zlib.compressobj(wbits=-15) if context_takeover else None
+        client_inflater = zlib.decompressobj(wbits=-15) if context_takeover else None
+        for message_index in range(2):
+            payload = f"server-{client_id}-{rng.choice(colors)}".encode("ascii")
+            await write_message(writer, 1, payload,
+                compressed=compression_enabled,
+                interleave_ping=compression_enabled and message_index == 0,
+                compressor=server_compressor)
+        if compression_offered or run_id == 5:
+            binary_payload = bytes((offset + client_id) & 0xff for offset in range(4096))
+            await write_message(writer, 2, binary_payload,
+                compressed=compression_enabled, compressor=server_compressor)
         ping = rng.getrandbits(64).to_bytes(8, "big")
         await write_frame(writer, 9, ping)
         echoes = 0
         received_pong = False
 
         while True:
-            opcode, payload = await read_frame(reader)
+            opcode, payload, compressed, _ = await read_frame(reader)
             if opcode in (1, 2):
-                await write_frame(writer, opcode, payload)
+                if compressed:
+                    payload = decompress_message(payload, client_inflater)
+                    metrics["compressed_client_messages"].add(identity)
+                await write_message(writer, opcode, payload,
+                    compressed=compression_enabled, compressor=server_compressor)
                 echoes += 1
             elif opcode == 9:
                 await write_frame(writer, 10, payload)
@@ -152,7 +235,9 @@ async def serve_one(reader, writer, metrics, drop_id):
             else:
                 return
     except (EOFError, asyncio.LimitOverrunError, OSError, ssl.SSLError,
-            asyncio.TimeoutError, KeyError, ValueError):
+            asyncio.TimeoutError, KeyError, ValueError) as error:
+        if compression_enabled:
+            print(f"compression peer {identity} stopped: {error!r}", file=sys.stderr)
         return
     finally:
         writer.close()
@@ -163,7 +248,8 @@ async def serve_one(reader, writer, metrics, drop_id):
 
 
 async def run_peer(client_test, openssl, client_count):
-    with tempfile.TemporaryDirectory(prefix="echter-wss-test-") as directory:
+    build_directory = os.path.dirname(os.path.abspath(client_test))
+    with tempfile.TemporaryDirectory(prefix="echter-wss-test-", dir=build_directory) as directory:
         certificate = os.path.join(directory, "test-ca.pem")
         private_key = os.path.join(directory, "test-key.pem")
         subprocess.run([
@@ -177,7 +263,11 @@ async def run_peer(client_test, openssl, client_count):
         tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls_context.load_cert_chain(certificate, private_key)
         metrics = {"drops": set(), "echoes": {}, "pongs": set(), "closes": set(),
-            "control_floods": {}, "no_responses": set()}
+            "control_floods": {}, "no_responses": set(), "negotiated": set(),
+            "compressed_client_messages": set(), "decompression_bombs": set(),
+            "configured_headers": set()}
+        metrics["extension_rejections"] = set()
+        metrics["extension_fallbacks"] = set()
         peer_tasks = set()
         drop_id = 0
 
@@ -193,11 +283,14 @@ async def run_peer(client_test, openssl, client_count):
         environment = os.environ.copy()
         environment["SSL_CERT_FILE"] = certificate
         try:
-            for run_id, host in enumerate(("localhost", "127.0.0.1")):
+            hosts = ("localhost", "127.0.0.1", "localhost", "127.0.0.1",
+                "localhost", "127.0.0.1")
+            for run_id, host in enumerate(hosts):
                 drop_id = random.Random(2026 + run_id).randrange(client_count)
                 process = await asyncio.create_subprocess_exec(
                     client_test, f"wss://{host}:{port}/?run={run_id}",
                     str(client_count), str(drop_id),
+                    *( ["deflate"] if run_id >= 2 else [] ),
                     env=environment)
                 try:
                     return_code = await asyncio.wait_for(process.wait(),
@@ -217,8 +310,11 @@ async def run_peer(client_test, openssl, client_count):
                     if client_id == drop_id:
                         continue
                     identity = (run_id, client_id)
-                    if metrics["echoes"].get(identity) != 2:
-                        raise SystemExit(f"server did not observe two echoes for {identity}")
+                    if identity not in metrics["configured_headers"]:
+                        raise SystemExit(f"SDK handshake headers were not verified for {identity}")
+                    expected_echoes = 3 if run_id >= 2 else 2
+                    if metrics["echoes"].get(identity) != expected_echoes:
+                        raise SystemExit(f"server observed an unexpected echo count for {identity}")
                     if identity not in metrics["pongs"]:
                         raise SystemExit(f"server did not receive the matching pong for {identity}")
                     if identity not in metrics["closes"]:
@@ -229,6 +325,35 @@ async def run_peer(client_test, openssl, client_count):
                     raise SystemExit("ping-flood peer sent no control frames")
                 if (run_id, NO_RESPONSE_CLIENT_ID) not in metrics["no_responses"]:
                     raise SystemExit("no-response handshake scenario was not selected")
+                if run_id in (2, 4):
+                    for client_id in range(1, client_count):
+                        if client_id == drop_id:
+                            continue
+                        identity = (run_id, client_id)
+                        if identity not in metrics["negotiated"]:
+                            raise SystemExit(f"permessage-deflate was not negotiated for {identity}")
+                        if identity not in metrics["compressed_client_messages"]:
+                            raise SystemExit(f"client sent no compressed message for {identity}")
+                if run_id == 2 and (run_id, DECOMPRESSION_BOMB_CLIENT_ID) \
+                        not in metrics["decompression_bombs"]:
+                    raise SystemExit("decompression expansion limit test did not reach the peer")
+                if run_id == 3:
+                    for client_id in range(1, client_count):
+                        if client_id == drop_id:
+                            continue
+                        identity = (run_id, client_id)
+                        if identity in metrics["negotiated"]:
+                            raise SystemExit(f"peer unexpectedly negotiated compression for {identity}")
+                        if identity in metrics["compressed_client_messages"]:
+                            raise SystemExit(f"client did not fall back to uncompressed mode for {identity}")
+                if run_id == 5:
+                    for client_id in range(1, client_count):
+                        if client_id == drop_id:
+                            continue
+                        identity = (run_id, client_id)
+                        if identity not in metrics["extension_rejections"] \
+                                or identity not in metrics["extension_fallbacks"]:
+                            raise SystemExit(f"HTTP 400 extension fallback did not complete for {identity}")
                 print(f"localhost WSS run {run_id} via {host}: "
                     f"{client_count - 1} clean sessions, seeded RST on client {drop_id}")
             child_peak_kib = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss

@@ -10,6 +10,7 @@
 
 import echter.ws.frame;
 import echter.ws.handshake;
+import echter.ws.compression;
 
 namespace {
 
@@ -31,6 +32,72 @@ void test_consecutive_complete_messages() {
 	assert(first && first->type == echter::ws::MessageType::text && view(first->payload) == "one");
 	auto second = assembler.consume(make_frame(echter::ws::FrameType::binary, true, "two"));
 	assert(second && second->type == echter::ws::MessageType::binary && view(second->payload) == "two");
+}
+
+void test_permessage_deflate_round_trip() {
+	const std::string input(4096, 'a');
+	const auto* bytes = reinterpret_cast<const std::byte*>(input.data());
+	echter::ws::PerMessageDeflate compressor(true);
+	echter::ws::PerMessageDeflate decompressor(true);
+	const auto compressed = compressor.compress(std::span<const std::byte>(bytes, input.size()));
+	assert(compressed.compressed);
+	const auto expanded = decompressor.decompress(compressed.payload);
+	assert(expanded.size() == input.size());
+	assert(std::equal(expanded.begin(), expanded.end(), bytes));
+
+	const auto repeated = compressor.compress(std::span<const std::byte>(bytes, input.size()));
+	assert(repeated.compressed);
+	assert(decompressor.decompress(repeated.payload) == expanded);
+}
+
+void test_permessage_deflate_final_block_and_exact_limit() {
+	const std::array<std::byte, 8> final_block{
+		std::byte{0xf3}, std::byte{0x48}, std::byte{0xcd}, std::byte{0xc9},
+		std::byte{0xc9}, std::byte{0x07}, std::byte{0x00}, std::byte{0x00}};
+	echter::ws::PerMessageDeflate inflater;
+	const auto hello = inflater.decompress(final_block);
+	assert(std::string_view(reinterpret_cast<const char*>(hello.data()), hello.size()) == "Hello");
+
+	const std::string input(echter::ws::max_message_size, 'q');
+	const auto* bytes = reinterpret_cast<const std::byte*>(input.data());
+	echter::ws::PerMessageDeflate compressor;
+	echter::ws::PerMessageDeflate limit_inflater;
+	const auto compressed = compressor.compress(std::span<const std::byte>(bytes, input.size()));
+	assert(compressed.compressed);
+	const auto expanded = limit_inflater.decompress(compressed.payload);
+	assert(expanded.size() == echter::ws::max_message_size);
+	assert(std::equal(expanded.begin(), expanded.end(), bytes));
+}
+
+void test_permessage_deflate_rejects_invalid_payloads() {
+	echter::ws::PerMessageDeflate invalid_decompressor(true);
+	const std::array<std::byte, 1> invalid{std::byte{0xff}};
+	bool rejected_invalid = false;
+	try {
+		(void)invalid_decompressor.decompress(invalid);
+	} catch (const std::runtime_error&) {
+		rejected_invalid = true;
+	}
+	assert(rejected_invalid);
+
+	const std::string input(4096, 'x');
+	const auto* bytes = reinterpret_cast<const std::byte*>(input.data());
+	echter::ws::PerMessageDeflate compressor(true);
+	echter::ws::PerMessageDeflate decompressor(true);
+	const auto compressed = compressor.compress(std::span<const std::byte>(bytes, input.size()));
+	assert(compressed.compressed);
+	auto expanded = decompressor.decompress(compressed.payload);
+	assert(echter::ws::valid_utf8(expanded));
+
+	std::vector<std::byte> invalid_text;
+	for (std::size_t index = 0; index < 128; ++index) {
+		invalid_text.push_back(std::byte{0xc0});
+		invalid_text.push_back(std::byte{0xaf});
+	}
+	auto text_compressed = compressor.compress(invalid_text);
+	assert(text_compressed.compressed);
+	auto invalid_expanded = decompressor.decompress(text_compressed.payload);
+	assert(!echter::ws::valid_utf8(invalid_expanded));
 }
 
 void test_control_frame_inside_fragmented_message() {
@@ -78,6 +145,35 @@ void test_frame_decoder() {
 	assert(frames.front().type == echter::ws::FrameType::text);
 	assert(frames.front().final);
 	assert(view(frames.front().payload) == "ok");
+}
+
+void test_compressed_frame_and_fragment_rules() {
+	const std::byte compressed_text[]{std::byte{0xc1}, std::byte{0x01}, std::byte{0x00}};
+	echter::ws::FrameDecoder decoder;
+	auto frames = decoder.consume(compressed_text);
+	assert(frames.size() == 1 && frames.front().compressed);
+
+	echter::ws::MessageAssembler assembler;
+	auto message = assembler.consume(std::move(frames.front()), true);
+	assert(message && message->compressed && message->type == echter::ws::MessageType::text);
+
+	bool rejected_unnegotiated = false;
+	try {
+		(void)echter::ws::MessageAssembler{}.consume(
+			{.type = echter::ws::FrameType::binary, .final = true, .payload = {}, .compressed = true});
+	} catch (const std::runtime_error&) {
+		rejected_unnegotiated = true;
+	}
+	assert(rejected_unnegotiated);
+
+	const std::byte compressed_continuation[]{std::byte{0xc0}, std::byte{0x00}};
+	bool rejected_continuation = false;
+	try {
+		(void)echter::ws::FrameDecoder{}.consume(compressed_continuation);
+	} catch (const std::runtime_error&) {
+		rejected_continuation = true;
+	}
+	assert(rejected_continuation);
 }
 
 void test_max_frame_with_coalesced_frames() {
@@ -331,13 +427,56 @@ void test_upgrade_requires_required_websocket_tokens() {
 	assert(rejected_malformed);
 }
 
+void test_permessage_deflate_negotiation() {
+	constexpr std::string_view key = "dGhlIHNhbXBsZSBub25jZQ==";
+	const std::string accept = echter::ws::detail::websocket_accept(key);
+	const std::string response = std::string("HTTP/1.1 101 Switching Protocols\r\n")
+		+ "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "
+		+ accept + "\r\nSec-WebSocket-Extensions: permessage-deflate; "
+		+ "client_no_context_takeover; server_no_context_takeover\r\n\r\n";
+	const auto selected = echter::ws::detail::validate_upgrade(response, key, true);
+	assert(selected.enabled && selected.client_no_context_takeover
+		&& selected.server_no_context_takeover);
+
+	const std::string declined = std::string("HTTP/1.1 101 Switching Protocols\r\n")
+		+ "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "
+		+ accept + "\r\n\r\n";
+	assert(!echter::ws::detail::validate_upgrade(declined, key, true).enabled);
+
+	for (const std::string_view extension : {
+			std::string_view("permessage-deflate; unknown=value"),
+			std::string_view("permessage-deflate; server_no_context_takeover; server_no_context_takeover")}) {
+		const std::string invalid = std::string("HTTP/1.1 101 Switching Protocols\r\n")
+			+ "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "
+			+ accept + "\r\nSec-WebSocket-Extensions: " + std::string(extension) + "\r\n\r\n";
+		bool rejected = false;
+		try {
+			(void)echter::ws::detail::validate_upgrade(invalid, key, true);
+		} catch (const std::runtime_error&) {
+			rejected = true;
+		}
+		assert(rejected);
+	}
+	bool rejected_unoffered = false;
+	try {
+		(void)echter::ws::detail::validate_upgrade(response, key);
+	} catch (const std::runtime_error&) {
+		rejected_unoffered = true;
+	}
+	assert(rejected_unoffered);
+}
+
 } // namespace
 
 int main() {
+	test_permessage_deflate_round_trip();
+	test_permessage_deflate_final_block_and_exact_limit();
+	test_permessage_deflate_rejects_invalid_payloads();
 	test_consecutive_complete_messages();
 	test_control_frame_inside_fragmented_message();
 	test_invalid_fragment_transitions();
 	test_frame_decoder();
+	test_compressed_frame_and_fragment_rules();
 	test_max_frame_with_coalesced_frames();
 	test_noncanonical_payload_lengths();
 	test_text_utf8_validation_after_reassembly();
@@ -345,4 +484,5 @@ int main() {
 	test_client_frame_encoder_validates_text_and_close();
 	test_url_rejects_control_and_invalid_ports();
 	test_upgrade_requires_required_websocket_tokens();
+	test_permessage_deflate_negotiation();
 }

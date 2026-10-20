@@ -5,6 +5,7 @@ project(Echter_Websockets LANGUAGES CXX)
 include(CTest)
 
 find_package(OpenSSL 3 REQUIRED COMPONENTS SSL)
+find_package(ZLIB REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 
@@ -18,10 +19,16 @@ target_sources(echter_websockets
         FILE_SET CXX_MODULES FILES
             src/echter.cppm
             src/ws/client.cppm
+            src/ws/compression.cppm
             src/ws/frame.cppm
             src/ws/handshake.cppm
+    PRIVATE
+        src/ws/client.cpp
+        src/ws/compression.cpp
+        src/ws/frame.cpp
+        src/ws/handshake.cpp
 )
-target_link_libraries(echter_websockets PRIVATE OpenSSL::SSL PkgConfig::LIBURING)
+target_link_libraries(echter_websockets PRIVATE OpenSSL::SSL PkgConfig::LIBURING ZLIB::ZLIB)
 
 add_executable(localtest examples/main.cpp)
 target_link_libraries(localtest PRIVATE echter_websockets)
