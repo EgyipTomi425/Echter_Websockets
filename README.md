@@ -146,6 +146,9 @@ sender.send_binary(payload);
 
 - `send_message()` validates UTF-8 and enforces the 8 MiB message limit.
 - `send_binary()` copies the provided byte span before enqueueing.
+- Sends accepted while the connection is `pending` wait for the WebSocket upgrade.
+- With compression enabled, messages preceding a peer's close frame are delivered
+  before `on_close`, including messages still waiting for decompression.
 - `close()` requests a normal close handshake and returns whether the command was accepted.
 - `Connection::state()` reports the atomic lifecycle snapshot: `pending`, `open`,
   `closing`, `closed`, or `failed`.

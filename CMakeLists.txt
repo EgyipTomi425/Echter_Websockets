@@ -48,5 +48,11 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/loopback_wss.py
                 $<TARGET_FILE:echter_ws_client_integration_tests> ${OPENSSL_COMMAND})
         set_tests_properties(echter_ws_five_client_integration PROPERTIES TIMEOUT 30)
+        add_executable(echter_ws_lifecycle_tests tests/lifecycle_regression.cpp)
+        target_link_libraries(echter_ws_lifecycle_tests PRIVATE echter_websockets)
+        add_test(NAME echter_ws_lifecycle_regressions
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/lifecycle_peer.py
+                $<TARGET_FILE:echter_ws_lifecycle_tests> ${OPENSSL_COMMAND})
+        set_tests_properties(echter_ws_lifecycle_regressions PROPERTIES TIMEOUT 20)
     endif()
 endif()

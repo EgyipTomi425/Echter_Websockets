@@ -186,6 +186,7 @@ struct SocketConnection {
 	bool compression_fallback_attempted = false;
 	bool compression_paused = false;
 	std::size_t pending_outbound_compressions = 0;
+	std::size_t pending_inbound_compressions = 0;
 	bool close_command_pending = false;
 	bool closing = false;
 	bool close_sent = false;
@@ -917,7 +918,8 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 						fail(command.id, error.what());
 						continue;
 					}
-					if (!drive(*found->second, 0)) {
+					if (found->second->stage == SocketConnection::Stage::open
+						&& !drive(*found->second, 0)) {
 						erase_connection(command.id);
 					}
 				} else {
@@ -945,9 +947,15 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 					continue;
 				}
 				if (command.compression_inbound) {
-					if (!found->second->closing
-						&& !notify_message(*found->second, command.message_type,
-							std::move(command.payload))) continue;
+					if (found->second->pending_inbound_compressions > 0) {
+						--found->second->pending_inbound_compressions;
+					}
+					// Messages received before the close frame must precede on_close.
+					if (!notify_message(*found->second, command.message_type,
+						std::move(command.payload))) continue;
+					if (found->second->close_received
+						&& found->second->pending_inbound_compressions == 0
+						&& !drive(*found->second, 0)) erase_connection(command.id);
 				} else if (!found->second->closing) {
 					try {
 						found->second->outgoing.push_back({
@@ -1027,6 +1035,7 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 			&& enqueue_compression_task(task, already_reserved);
 		const bool accepted = scheduled || defer_compression_task(connection, task);
 		if (accepted && outbound) ++connection.pending_outbound_compressions;
+		if (accepted && !outbound) ++connection.pending_inbound_compressions;
 		return accepted;
 	}
 
@@ -1256,7 +1265,7 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 			connection.stage = SocketConnection::Stage::upgrade_read;
 		}
 
-		if (connection.stage == SocketConnection::Stage::upgrade_read) {
+		while (connection.stage == SocketConnection::Stage::upgrade_read) {
 			std::array<char, 4096> buffer{};
 			std::size_t count = 0;
 			ERR_clear_error();
@@ -1265,7 +1274,9 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 			connection.response.append(buffer.data(), count);
 			if (connection.response.size() > 16 * 1024) { fail(connection.id, "upgrade headers too large"); return false; }
 			const std::size_t headers_end = connection.response.find("\r\n\r\n");
-			if (headers_end == std::string::npos) return arm_connection(connection, POLLIN);
+			// SSL may already hold the rest of this TLS record even when the
+			// socket is no longer readable. Read until OpenSSL requests a poll.
+			if (headers_end == std::string::npos) continue;
 			const std::size_t body_start = headers_end + 4;
 			if (body_start < connection.response.size()) {
 				const auto* bytes = reinterpret_cast<const std::byte*>(connection.response.data() + body_start);
@@ -1308,6 +1319,10 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 		}
 
 		if (connection.stage == SocketConnection::Stage::open) {
+			if (connection.close_received) {
+				if (connection.pending_inbound_compressions > 0) return true;
+				if (connection.close_sent) return false;
+			}
 			for (unsigned work = 0; work < 16; ++work) {
 
 			if (!connection.outgoing.empty()) {
@@ -1382,7 +1397,9 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 					connection.closing = true;
 					connection.lifecycle->state.store(ConnectionState::closing,
 						std::memory_order_release);
-					if (connection.close_sent) return false;
+					if (connection.close_sent) {
+						return connection.pending_inbound_compressions > 0;
+					}
 					const bool partial_frame = connection.outgoing_offset > 0;
 					const bool partial_close = partial_frame
 						&& connection.outgoing.front().type == FrameType::close;
@@ -1406,6 +1423,7 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 							.type = FrameType::close});
 					}
 					set_timeout(connection.id, connection.timeouts.close);
+					if (connection.pending_inbound_compressions > 0) return true;
 					return arm_connection(connection, POLLOUT);
 				} else {
 					auto message = connection.assembler.consume(std::move(frame),
@@ -1498,7 +1516,7 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 	}
 
 	bool notify_message(SocketConnection& connection, MessageType type, std::vector<std::byte> message) {
-		set_timeout(connection.id, connection.timeouts.idle);
+		if (!connection.closing) set_timeout(connection.id, connection.timeouts.idle);
 		auto callbacks = connection.callbacks;
 		if (!callbacks->on_message) return true;
 		Connection connection_handle = handle(connection.id);
