@@ -17,7 +17,8 @@ module echter.ws.handshake;
 namespace echter::ws::detail {
 
 bool contains_control_chars(std::string_view value) {
-	for (const unsigned char ch : value) {
+	for (const char raw : value) {
+		const auto ch = static_cast<unsigned char>(raw);
 		if (ch <= 0x1f || ch == 0x7f) {
 			return true;
 		}
@@ -29,7 +30,8 @@ bool is_numeric_port(std::string_view value) {
 	if (value.empty() || value.size() > 5) {
 		return false;
 	}
-	for (const unsigned char ch : value) {
+	for (const char raw : value) {
+		const auto ch = static_cast<unsigned char>(raw);
 		if (!std::isdigit(ch)) {
 			return false;
 		}
@@ -84,14 +86,16 @@ std::vector<std::pair<std::string, std::string>> parse_response_headers(
 			throw std::runtime_error("malformed WebSocket upgrade header line");
 		}
 		const std::string_view name = line.substr(0, colon);
-		for (const unsigned char ch : name) {
+		for (const char raw : name) {
+			const auto ch = static_cast<unsigned char>(raw);
 			const bool token = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
-				|| (ch >= '0' && ch <= '9') || std::string_view("!#$%&'*+-.^_`|~").find(ch)
+				|| (ch >= '0' && ch <= '9') || std::string_view("!#$%&'*+-.^_`|~").find(static_cast<char>(ch))
 					!= std::string_view::npos;
 			if (!token) throw std::runtime_error("invalid WebSocket upgrade header name");
 		}
 		const std::string_view value = line.substr(colon + 1);
-		for (const unsigned char ch : value) {
+		for (const char raw : value) {
+			const auto ch = static_cast<unsigned char>(raw);
 			if ((ch < 0x20 && ch != '\t') || ch == 0x7f) {
 				throw std::runtime_error("invalid control character in WebSocket upgrade header");
 			}
@@ -234,7 +238,8 @@ Url parse_url(std::string_view url) {
 				|| label.back() == '-') {
 				throw std::invalid_argument("invalid DNS URL host");
 			}
-			for (const unsigned char ch : label) {
+			for (const char raw : label) {
+				const auto ch = static_cast<unsigned char>(raw);
 				if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
 					|| (ch >= '0' && ch <= '9') || ch == '-')) {
 					throw std::invalid_argument("invalid DNS URL host character");

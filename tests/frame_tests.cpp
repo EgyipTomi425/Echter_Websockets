@@ -18,7 +18,7 @@ echter::ws::Frame make_frame(echter::ws::FrameType type, bool final,
 	std::string_view payload) {
 	std::vector<std::byte> bytes;
 	bytes.reserve(payload.size());
-	for (const unsigned char value : payload) bytes.push_back(static_cast<std::byte>(value));
+	for (const char value : payload) bytes.push_back(static_cast<std::byte>(static_cast<unsigned char>(value)));
 	return {type, final, std::move(bytes)};
 }
 
