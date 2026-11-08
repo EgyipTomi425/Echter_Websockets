@@ -24,6 +24,7 @@ async def run(client, openssl):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(certificate, private_key)
         tasks = set()
+        fallback_attempts = {}
 
         async def serve(reader, writer):
             try:
@@ -31,17 +32,38 @@ async def run(client, openssl):
                 mode = request.split(b" ")[1].strip(b"/").decode("ascii")
                 headers = dict(line.split(b": ", 1) for line in request.split(b"\r\n")[1:]
                     if b": " in line)
+                if mode.startswith("fallback_"):
+                    fallback_attempts[mode] = fallback_attempts.get(mode, 0) + 1
+                    if b"Sec-WebSocket-Extensions" in headers:
+                        writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                        await writer.drain()
+                        return
                 accept = base64.b64encode(hashlib.sha1(headers[b"Sec-WebSocket-Key"]
                     + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
-                compressed = mode in ("compressed", "negotiated_plain")
+                compressed = mode in ("compressed", "negotiated_plain", "fallback_bad")
                 response = (b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
                     b"Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n")
                 if compressed:
                     response += b"Sec-WebSocket-Extensions: permessage-deflate\r\n"
                 if mode == "largeheader":
                     response += b"X-Padding: " + b"a" * 5000 + b"\r\n"
-                writer.write(response + b"\r\n")
-                await writer.drain()
+                if mode == "headerboundary":
+                    # Header bytes fit the limit exactly. Data following them
+                    # in the same TLS read must not count toward that limit.
+                    padding = 16 * 1024 - len(response) - len(b"X-Padding: \r\n\r\n")
+                    response += b"X-Padding: " + b"a" * padding + b"\r\n"
+                response += b"\r\n"
+                if mode == "headerboundary":
+                    writer.write(response[:15000])
+                    await writer.drain()
+                    await asyncio.sleep(0.05)
+                    response = response[15000:]
+                else:
+                    writer.write(response)
+                    await writer.drain()
+                if mode == "fallback_bad":
+                    await asyncio.wait_for(reader.read(), 3)
+                    return
                 if mode == "largeheader":
                     # No socket traffic may rescue an upgrade stalled in SSL's buffer.
                     await asyncio.sleep(3)
@@ -54,7 +76,8 @@ async def run(client, openssl):
                 if wire_compressed:
                     payload = compress_message(payload)
                 # A single TLS write makes the message and close arrive together.
-                writer.write(encode_frame(1, payload, compressed=wire_compressed)
+                writer.write((response if mode == "headerboundary" else b"")
+                    + encode_frame(1, payload, compressed=wire_compressed)
                     + encode_frame(8, b"\x03\xe8"))
                 await writer.drain()
                 opcode, _, _, _ = await asyncio.wait_for(read_frame(reader), 3)
@@ -77,7 +100,8 @@ async def run(client, openssl):
         environment = dict(os.environ, SSL_CERT_FILE=certificate)
         try:
             port = server.sockets[0].getsockname()[1]
-            for mode in ("plain", "compressed", "negotiated_plain", "early", "largeheader"):
+            for mode in ("plain", "compressed", "negotiated_plain", "early", "largeheader",
+                    "headerboundary", "fallback_good", "fallback_bad"):
                 process = await asyncio.create_subprocess_exec(client,
                     f"wss://127.0.0.1:{port}/{mode}", mode, env=environment)
                 try:
@@ -89,6 +113,8 @@ async def run(client, openssl):
                 if result:
                     raise RuntimeError(f"{mode}: client exited with {result}")
             await asyncio.gather(*tasks)
+            if fallback_attempts != {"fallback_good": 2, "fallback_bad": 2}:
+                raise RuntimeError(f"unexpected fallback reconnects: {fallback_attempts}")
         finally:
             server.close()
             await server.wait_closed()

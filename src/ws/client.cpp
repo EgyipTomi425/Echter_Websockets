@@ -1227,8 +1227,9 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 			if (::getsockopt(connection.socket, SOL_SOCKET, SO_ERROR, &error, &size) != 0 || error != 0) {
 				::close(connection.socket);
 				connection.socket = -1;
-				if (connect_next(connection)) return true;
+				// A failed TLS setup can erase the connection inside connect_next.
 				const std::uint64_t id = connection.id;
+				if (connect_next(connection)) return true;
 				if (connections.contains(id)) {
 					fail(id, "TCP connect failed for all resolved addresses");
 				}
@@ -1272,8 +1273,10 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 			const int result = SSL_read_ex(connection.ssl, buffer.data(), buffer.size(), &count);
 			if (result != 1) return wait_for(connection, SSL_get_error(connection.ssl, result));
 			connection.response.append(buffer.data(), count);
-			if (connection.response.size() > 16 * 1024) { fail(connection.id, "upgrade headers too large"); return false; }
 			const std::size_t headers_end = connection.response.find("\r\n\r\n");
+			const std::size_t header_size = headers_end == std::string::npos
+				? connection.response.size() : headers_end + 4;
+			if (header_size > 16 * 1024) { fail(connection.id, "upgrade headers too large"); return false; }
 			// SSL may already hold the rest of this TLS record even when the
 			// socket is no longer readable. Read until OpenSSL requests a poll.
 			if (headers_end == std::string::npos) continue;
@@ -1289,7 +1292,8 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 			}
 			try {
 				const auto selection = echter::ws::detail::validate_upgrade(
-					connection.response, connection.key, enable_permessage_deflate);
+					connection.response, connection.key,
+					enable_permessage_deflate && !connection.compression_fallback_attempted);
 				connection.compression_enabled = selection.enabled;
 				if (selection.enabled) {
 					connection.compression = std::make_shared<PerMessageDeflate>(
@@ -1479,9 +1483,10 @@ struct Runtime : std::enable_shared_from_this<Runtime> {
 		connection.compression_enabled = false;
 		connection.stage = SocketConnection::Stage::connecting;
 		set_timeout(connection.id, connection.timeouts.handshake);
+		const std::uint64_t id = connection.id;
 		if (connect_next(connection)) return true;
-		if (connections.contains(connection.id)) {
-			fail(connection.id, "uncompressed WebSocket reconnect failed");
+		if (connections.contains(id)) {
+			fail(id, "uncompressed WebSocket reconnect failed");
 		}
 		return false;
 	}

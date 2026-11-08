@@ -48,6 +48,14 @@ int main(int argc, char** argv) {
         std::cerr << mode << ": timed out\n";
         return 1;
     }
+    if (mode == "fallback_bad") {
+        if (opened || !received.empty() || error.find("unoffered") == std::string::npos) {
+            std::cerr << mode << ": unoffered fallback extension accepted: " << error << '\n';
+            return 1;
+        }
+        std::cout << mode << ": unoffered fallback extension rejected\n";
+        return 0;
+    }
     const std::string expected = mode == "early" ? "early" : "last message";
     if (!error.empty() || !opened || received != expected) {
         std::cerr << mode << ": " << error << "; received='" << received << "'\n";
