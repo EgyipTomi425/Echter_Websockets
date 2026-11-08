@@ -1600,15 +1600,18 @@ struct ConnectionImpl {
 };
 
 struct ClientImpl {
-	explicit ClientImpl(ClientOptions options) : runtime(std::make_shared<Runtime>(options)) {}
+	explicit ClientImpl(ClientOptions options)
+		: runtime(new Runtime(std::move(options)), [](Runtime* value) {
+			// Connection operations can temporarily own the final reference even
+			// when Client is destroyed on another thread. Every final release on
+			// a callback worker must avoid joining that worker from itself.
+			if (value->is_callback_worker()) {
+				std::thread([value] { delete value; }).detach();
+			} else {
+				delete value;
+			}
+		}) {}
 	std::shared_ptr<Runtime> runtime;
-	~ClientImpl() {
-		if (!runtime || !runtime->is_callback_worker()) return;
-		auto keep_alive = std::move(runtime);
-		std::thread([runtime = std::move(keep_alive)]() mutable {
-			runtime.reset();
-		}).detach();
-	}
 };
 
 } // namespace echter::ws::client::detail

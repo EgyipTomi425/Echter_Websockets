@@ -53,6 +53,6 @@ if(BUILD_TESTING)
         add_test(NAME echter_ws_lifecycle_regressions
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/lifecycle_peer.py
                 $<TARGET_FILE:echter_ws_lifecycle_tests> ${OPENSSL_COMMAND})
-        set_tests_properties(echter_ws_lifecycle_regressions PROPERTIES TIMEOUT 20)
+        set_tests_properties(echter_ws_lifecycle_regressions PROPERTIES TIMEOUT 30)
     endif()
 endif()

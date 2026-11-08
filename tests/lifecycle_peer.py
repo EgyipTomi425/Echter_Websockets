@@ -61,6 +61,11 @@ async def run(client, openssl):
                 else:
                     writer.write(response)
                     await writer.drain()
+                if mode == "runtime_race":
+                    # Keep the connection open while the public API races a
+                    # callback send against owner destruction on another thread.
+                    await asyncio.wait_for(reader.read(), 5)
+                    return
                 if mode == "fallback_bad":
                     await asyncio.wait_for(reader.read(), 3)
                     return
@@ -101,11 +106,14 @@ async def run(client, openssl):
         try:
             port = server.sockets[0].getsockname()[1]
             for mode in ("plain", "compressed", "negotiated_plain", "early", "largeheader",
-                    "headerboundary", "fallback_good", "fallback_bad"):
+                    "headerboundary", "fallback_good", "fallback_bad", "runtime_race"):
                 process = await asyncio.create_subprocess_exec(client,
                     f"wss://127.0.0.1:{port}/{mode}", mode, env=environment)
                 try:
-                    result = await asyncio.wait_for(process.wait(), 8)
+                    # Four runtime teardowns with 8 MiB sends can exceed the
+                    # ordinary case's budget under memory instrumentation.
+                    timeout = 20 if mode == "runtime_race" else 8
+                    result = await asyncio.wait_for(process.wait(), timeout)
                 except asyncio.TimeoutError:
                     process.kill()
                     await process.wait()
