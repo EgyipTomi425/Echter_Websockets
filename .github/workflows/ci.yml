@@ -5,33 +5,55 @@ on:
     branches: [ master ]
   pull_request:
     branches: [ master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: websocket-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
+    name: ${{ matrix.compiler }}
     runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cc: gcc
+            cxx: g++
+            extra_flags: -Wno-attributes
+          - compiler: clang
+            cc: clang
+            cxx: clang++
+            extra_flags: ""
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Install toolchain and deps
+        timeout-minutes: 8
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build cmake pkg-config liburing-dev libssl-dev zlib1g-dev
+          # Keep Ubuntu signatures; avoid the runner's failing Azure mirror DNS.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          fi
+          apt_options=(-o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=120)
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" update --error-on=any
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install -y --no-install-recommends cmake ninja-build g++ clang clang-tools pkg-config liburing-dev libssl-dev zlib1g-dev
 
       - name: Configure
-        env:
-          CC: gcc
-          CXX: g++
-        run: cmake -S . -B build -G Ninja -DCMAKE_CXX_SCAN_FOR_MODULES=ON -DCMAKE_CXX_FLAGS='-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror -Wno-attributes'
+        run: cmake -S . -B build -G Ninja -DCMAKE_CXX_SCAN_FOR_MODULES=ON -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror ${{ matrix.extra_flags }}"
 
       - name: Build
-        env:
-          CC: gcc
-          CXX: g++
-        run: cmake --build build --parallel 1
+        run: cmake --build build --parallel 4
 
       - name: Test
-        env:
-          CC: gcc
-          CXX: g++
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --no-tests=error

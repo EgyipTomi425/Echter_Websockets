@@ -76,7 +76,7 @@ the corresponding `.cpp` files.
 
 ```sh
 cmake -S . -B build -G Ninja
-cmake --build build
+cmake --build build --parallel 4
 ./build/localtest wss://example.org/path
 ctest --test-dir build --output-on-failure
 ```
@@ -258,7 +258,7 @@ traffic, and they also cover failure recovery and callback teardown.
 
 ```sh
 cmake -S . -B build -G Ninja
-cmake --build build
+cmake --build build --parallel 4
 ctest --test-dir build --output-on-failure
 ```
 
