@@ -43,7 +43,7 @@ jobs:
         run: |
           # Keep Ubuntu signatures; avoid the runner's failing Azure mirror DNS.
           if [[ -f /etc/apt/apt-mirrors.txt ]]; then
-            printf '%s\n' 'https://mirrors.edge.kernel.org/ubuntu' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+            printf '%s\n' 'https://archive.ubuntu.com/ubuntu' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
           fi
           apt_options=(-o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o DPkg::Lock::Timeout=120)
           sudo env DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" update --error-on=any
